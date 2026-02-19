@@ -322,6 +322,7 @@ async def synthesize_speech(text: str) -> tuple[bytes, float]:
             json={
                 "text": text,
                 "model_id": "eleven_multilingual_v2",
+                "output_format": "mp3_44100_128",
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
             },
         )
@@ -406,9 +407,17 @@ async def twilio_media_stream(websocket: WebSocket, session_id: str):
                 manager.disconnect(session_id)
                 break
             
-            if data.get("event") == "media" or (len(manager.audio_buffers[session_id]) > 8000):
-                if len(manager.audio_buffers[session_id]) >= 8000:
+            if data.get("event") == "media" or (len(manager.audio_buffers[session_id]) > 32000):
+                if len(manager.audio_buffers[session_id]) >= 32000:
                     audio_buffer = bytes(manager.audio_buffers[session_id])
+                    
+                    # Silence check - agar sirf noise hai toh skip karo
+                    pcm_check = np.frombuffer(audio_buffer, dtype=np.uint8).astype(np.float32)
+                    rms = np.sqrt(np.mean(pcm_check ** 2))
+                    if rms < 10:  # silence threshold
+                        manager.audio_buffers[session_id].clear()
+                        continue  # skip karo, Whisper mat bulao
+                    
                     manager.audio_buffers[session_id].clear()
                     
                     try:

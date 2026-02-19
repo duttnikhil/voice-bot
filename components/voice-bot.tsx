@@ -33,8 +33,12 @@ export default function VoiceBot({ botType = 'quickrupee' }: { botType?: string 
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audioPlaybackRef = useRef<AudioContext | null>(null);
+  const audioBufferRef = useRef<Uint8Array[]>([]);
+  const initializedRef = useRef(false);
 
   useEffect(() => {
+    if (initializedRef.current) return;
+    initializedRef.current = true;
     initializeSession();
     return () => {
       if (wsRef.current) wsRef.current.close();
@@ -96,12 +100,20 @@ export default function VoiceBot({ botType = 'quickrupee' }: { botType?: string 
       setIsRecording(false);
       setIsProcessing(false);
     }
+
+    // Play audio when message has audio
+    if (msg.has_audio) {
+      // Use a small delay to ensure all chunks are received
+      setTimeout(() => {
+        playCompleteAudio();
+      }, 500);
+    }
   };
 
   const handleAudioData = async (arrayBuffer: ArrayBuffer) => {
     if (arrayBuffer.byteLength > 6 && new TextDecoder().decode(new Uint8Array(arrayBuffer, 0, 12)) === 'AUDIO_CHUNK:') {
       const audioData = arrayBuffer.slice(12);
-      await playAudioChunk(new Uint8Array(audioData));
+      audioBufferRef.current.push(new Uint8Array(audioData));
     }
   };
 
@@ -109,13 +121,41 @@ export default function VoiceBot({ botType = 'quickrupee' }: { botType?: string 
     if (!audioPlaybackRef.current) {
       audioPlaybackRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
-
     const ctx = audioPlaybackRef.current;
-    const buffer = await ctx.decodeAudioData(audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength));
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.start(0);
+    try {
+      // Create a proper copy of the buffer
+      const buffer = audioData.buffer.slice(
+        audioData.byteOffset, 
+        audioData.byteOffset + audioData.byteLength
+      );
+      const decoded = await ctx.decodeAudioData(buffer as ArrayBuffer);
+      const source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch (e) {
+      console.error('Audio decode failed:', e);
+    }
+  };
+
+  const playCompleteAudio = async () => {
+    if (audioBufferRef.current.length === 0) return;
+    
+    // Combine all chunks into a single MP3
+    const totalLength = audioBufferRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+    const completeAudio = new Uint8Array(totalLength);
+    let offset = 0;
+    
+    for (const chunk of audioBufferRef.current) {
+      completeAudio.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // Clear buffer for next audio
+    audioBufferRef.current = [];
+    
+    // Play the complete MP3
+    await playAudioChunk(completeAudio);
   };
 
   const startRecording = async () => {
@@ -197,24 +237,17 @@ export default function VoiceBot({ botType = 'quickrupee' }: { botType?: string 
           </div>
 
           <div className="flex gap-2">
-            {!isRecording && (
-              <Button
-                onClick={startRecording}
-                disabled={isProcessing}
-                className="flex-1 bg-blue-600 hover:bg-blue-700"
-              >
-                Start Recording
-              </Button>
-            )}
-            {isRecording && (
-              <Button
-                onClick={stopRecording}
-                disabled={isProcessing}
-                className="flex-1 bg-red-600 hover:bg-red-700"
-              >
-                Stop Recording
-              </Button>
-            )}
+            <Button
+              onMouseDown={startRecording}
+              onMouseUp={stopRecording}
+              onMouseLeave={stopRecording}
+              onTouchStart={startRecording}
+              onTouchEnd={stopRecording}
+              disabled={isProcessing}
+              className={`flex-1 ${isRecording ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
+            >
+              {isRecording ? 'Release to Stop' : 'Hold to Speak'}
+            </Button>
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-sm">
