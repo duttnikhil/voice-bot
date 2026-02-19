@@ -43,27 +43,25 @@ export default function VoiceBot({ botType = 'quickrupee' }: { botType?: string 
 
   const initializeSession = async () => {
     try {
-      const response = await fetch('/api/init-session', {
+      const response = await fetch('https://voice-bot-production-8d49.up.railway.app/api/init-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ bot_type: botType }),
       });
       const { session_id, ws_url } = await response.json();
       setSessionId(session_id);
+      
+      connectWebSocket(ws_url); 
+      console.log("WS URL FROM BACKEND:", ws_url);
 
-      const wsEndpoint = ws_url.replace('ws://localhost:8000', `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/ws`);
-      connectWebSocket(session_id);
     } catch (error) {
       console.error('Failed to initialize session:', error);
     }
   };
 
-  const connectWebSocket = (sid: string) => {
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${protocol}://${window.location.host}/api/ws/voice/${sid}`;
-    
-    wsRef.current = new WebSocket(wsUrl);
-    wsRef.current.binaryType = 'arraybuffer';
+  const connectWebSocket = (url: string) => {
+      wsRef.current = new WebSocket(url);
+      wsRef.current.binaryType = 'arraybuffer';
 
     wsRef.current.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
