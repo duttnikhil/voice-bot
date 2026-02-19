@@ -311,7 +311,7 @@ async def transcribe_audio(audio_bytes: bytes) -> tuple[str, float]:
 
 async def synthesize_speech(text: str) -> tuple[bytes, float]:
     start = time.time()
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
@@ -322,16 +322,15 @@ async def synthesize_speech(text: str) -> tuple[bytes, float]:
             json={
                 "text": text,
                 "model_id": "eleven_multilingual_v2",
-                "output_format": "mp3_44100_128",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                "output_format": "pcm_16000"
             },
         )
         response.raise_for_status()
-    
+
     audio_bytes = response.content
     latency = time.time() - start
-    
     return audio_bytes, latency
+
 
 @app.post("/voice")
 async def voice_webhook():
@@ -350,8 +349,10 @@ async def voice_webhook():
 
 @app.websocket("/ws/twilio/{session_id}")
 async def twilio_media_stream(websocket: WebSocket, session_id: str):
-    await manager.connect(websocket, session_id)
-    
+    await websocket.accept()
+
+    stream_sid = None
+
     session = SessionData(
         session_id=session_id,
         bot_type=BotType.QUICKRUPEE,
@@ -359,176 +360,54 @@ async def twilio_media_stream(websocket: WebSocket, session_id: str):
         answers={},
         start_time=time.time(),
     )
-    manager.sessions[session_id] = session
-    
+
     try:
-        greeting = BotLogic.get_greeting(session.bot_type)
-        audio_bytes, tts_latency = await synthesize_speech(greeting)
-        
-        pcm_8k = AudioConverter.resample_16k_to_8k(audio_bytes)
-        ulaw_audio = AudioConverter.pcm_to_ulaw(pcm_8k)
-        
-        chunk_size = 320
-        for i in range(0, len(ulaw_audio), chunk_size):
-            chunk = ulaw_audio[i : i + chunk_size]
-            base64_chunk = base64.b64encode(chunk).decode("utf-8")
-            
-            media_message = {
-                "jsonrpc": "2.0",
-                "result": {
-                    "payload": base64_chunk
-                },
-                "id": 1
-            }
-            
-            await websocket.send_json(media_message)
-        
-        session.state = BotState.Q1
-        
         while True:
-            try:
-                data = await asyncio.wait_for(websocket.receive_json(), timeout=120)
-            except asyncio.TimeoutError:
-                break
-            
+            data = await websocket.receive_json()
+
+            # 🔥 Wait for START event first
             if data.get("event") == "start":
+                stream_sid = data["start"]["streamSid"]
+                logger.info(f"Stream SID: {stream_sid}")
+
+                # 👉 Now send greeting AFTER streamSid received
+                greeting = BotLogic.get_greeting(session.bot_type)
+                audio_bytes, _ = await synthesize_speech(greeting)
+
+                pcm_8k = AudioConverter.resample_16k_to_8k(audio_bytes)
+                ulaw_audio = AudioConverter.pcm_to_ulaw(pcm_8k)
+
+                chunk_size = 320
+                for i in range(0, len(ulaw_audio), chunk_size):
+                    chunk = ulaw_audio[i:i+chunk_size]
+                    base64_chunk = base64.b64encode(chunk).decode("utf-8")
+
+                    await websocket.send_json({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {
+                            "payload": base64_chunk
+                        }
+                    })
+
+                session.state = BotState.Q1
                 continue
-            
-            elif data.get("event") == "media":
-                payload = data.get("media", {}).get("payload")
-                if payload:
-                    try:
-                        audio_chunk = base64.b64decode(payload)
-                        manager.audio_buffers[session_id].extend(audio_chunk)
-                    except Exception as e:
-                        logger.error(f"Error decoding Twilio audio: {e}")
-            
-            elif data.get("event") == "stop":
-                manager.disconnect(session_id)
+
+            # 🔥 Handle incoming user voice
+            if data.get("event") == "media":
+                payload = data["media"]["payload"]
+                audio_chunk = base64.b64decode(payload)
+                manager.audio_buffers[session_id].extend(audio_chunk)
+
+            if data.get("event") == "stop":
                 break
-            
-            if data.get("event") == "media" or (len(manager.audio_buffers[session_id]) > 32000):
-                if len(manager.audio_buffers[session_id]) >= 32000:
-                    audio_buffer = bytes(manager.audio_buffers[session_id])
-                    
-                    # Silence check - agar sirf noise hai toh skip karo
-                    pcm_check = np.frombuffer(audio_buffer, dtype=np.uint8).astype(np.float32)
-                    rms = np.sqrt(np.mean(pcm_check ** 2))
-                    if rms < 10:  # silence threshold
-                        manager.audio_buffers[session_id].clear()
-                        continue  # skip karo, Whisper mat bulao
-                    
-                    manager.audio_buffers[session_id].clear()
-                    
-                    try:
-                        pcm_8k = AudioConverter.ulaw_to_pcm(audio_buffer)
-                        pcm_16k = AudioConverter.resample_8k_to_16k(pcm_8k)
-                        
-                        wav_io = io.BytesIO()
-                        with wave.open(wav_io, "wb") as wav_file:
-                            wav_file.setnchannels(1)
-                            wav_file.setsampwidth(2)
-                            wav_file.setframerate(16000)
-                            wav_file.writeframes(pcm_16k)
-                        
-                        wav_io.seek(0)
-                        
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            files = {"file": ("audio.wav", wav_io, "audio/wav")}
-                            data_payload = {"model": "whisper-1"}
-                            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-                            
-                            response = await client.post(
-                                "https://api.openai.com/v1/audio/transcriptions",
-                                files=files,
-                                data=data_payload,
-                                headers=headers,
-                            )
-                            response.raise_for_status()
-                        
-                        result = response.json()
-                        transcription = result["text"]
-                        
-                        answer = BotLogic.parse_yes_no(transcription)
-                        
-                        if answer is None:
-                            response_text = "I didn't quite understand. Could you please say yes or no?"
-                            audio_bytes, tts_latency = await synthesize_speech(
-                                response_text
-                            )
-                        else:
-                            question_id = session.state.value
-                            session.answers[question_id] = answer
-                            
-                            if session.state == BotState.Q3:
-                                is_eligible, result_text = BotLogic.evaluate_eligibility(
-                                    session.bot_type, session.answers
-                                )
-                                audio_bytes, tts_latency = await synthesize_speech(
-                                    result_text
-                                )
-                                
-                                session.state = BotState.END
-                                
-                                pcm_8k = AudioConverter.resample_16k_to_8k(audio_bytes)
-                                ulaw_audio = AudioConverter.pcm_to_ulaw(pcm_8k)
-                                
-                                chunk_size = 320
-                                for i in range(0, len(ulaw_audio), chunk_size):
-                                    chunk = ulaw_audio[i : i + chunk_size]
-                                    base64_chunk = base64.b64encode(chunk).decode("utf-8")
-                                    
-                                    media_message = {
-                                        "jsonrpc": "2.0",
-                                        "result": {
-                                            "payload": base64_chunk
-                                        },
-                                        "id": 1
-                                    }
-                                    
-                                    await websocket.send_json(media_message)
-                                
-                                break
-                            else:
-                                if session.state == BotState.Q1:
-                                    session.state = BotState.Q2
-                                elif session.state == BotState.Q2:
-                                    session.state = BotState.Q3
-                                
-                                question = BotLogic.get_next_question(
-                                    session.bot_type, session.state
-                                )
-                                if question:
-                                    audio_bytes, tts_latency = await synthesize_speech(
-                                        question["text"]
-                                    )
-                        
-                        pcm_8k = AudioConverter.resample_16k_to_8k(audio_bytes)
-                        ulaw_audio = AudioConverter.pcm_to_ulaw(pcm_8k)
-                        
-                        chunk_size = 320
-                        for i in range(0, len(ulaw_audio), chunk_size):
-                            chunk = ulaw_audio[i : i + chunk_size]
-                            base64_chunk = base64.b64encode(chunk).decode("utf-8")
-                            
-                            media_message = {
-                                "jsonrpc": "2.0",
-                                "result": {
-                                    "payload": base64_chunk
-                                },
-                                "id": 1
-                            }
-                            
-                            await websocket.send_json(media_message)
-                    
-                    except Exception as e:
-                        logger.error(f"Error processing Twilio audio: {e}")
-    
-    except WebSocketDisconnect:
-        manager.disconnect(session_id)
+
     except Exception as e:
-        logger.error(f"Twilio WebSocket error: {e}")
-        manager.disconnect(session_id)
+        logger.error(f"Twilio error: {e}")
+
+    finally:
+        logger.info("Call ended")
+
 
 @app.websocket("/ws/voice/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
