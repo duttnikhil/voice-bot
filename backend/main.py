@@ -24,6 +24,10 @@ from twilio.twiml.voice_response import VoiceResponse, Start
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+domain = os.getenv("PUBLIC_DOMAIN", "localhost:8000")
+
+protocol = "wss" if "railway.app" in domain else "ws"
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -673,11 +677,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 async def init_session(bot_type: str = "quickrupee"):
     session_id = str(uuid.uuid4())
     return {
-        "session_id": session_id,
-        "bot_type": bot_type,
-        "ws_url": f"ws://localhost:8000/ws/voice/{session_id}",
-    }
+    "session_id": session_id,
+    "bot_type": bot_type,
+    "ws_url": f"{protocol}://{domain}/ws/voice/{session_id}",
+}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
