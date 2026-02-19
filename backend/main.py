@@ -24,7 +24,7 @@ from twilio.twiml.voice_response import VoiceResponse, Start
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-domain = os.getenv("PUBLIC_DOMAIN", "localhost:8000")
+domain = os.getenv("PUBLIC_DOMAIN", "localhost:8080")
 
 protocol = "wss" if "railway.app" in domain else "ws"
 
@@ -390,7 +390,7 @@ async def twilio_media_stream(websocket: WebSocket, session_id: str):
                         }
                     })
 
-                session.state = BotState.Q1
+                session.state = BotState.GREETING
                 continue
 
             # 🔥 Handle incoming user voice
@@ -441,7 +441,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await manager.send_audio_chunk(session_id, chunk, "greeting")
             await asyncio.sleep(0.01)
         
-        session.state = BotState.Q1
+        session.state = BotState.GREETING
         
         while True:
             data = await websocket.receive_bytes()
@@ -464,6 +464,33 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                             },
                         )
                         
+                        if session.state == BotState.GREETING:
+                            session.state = BotState.Q1
+                            question = BotLogic.get_next_question(
+                                session.bot_type, session.state
+                            )
+                            if question:
+                                audio_bytes, tts_latency = await synthesize_speech(
+                                    question["text"]
+                                )
+                                
+                                await manager.send_message(
+                                    session_id,
+                                    {
+                                        "type": "question",
+                                        "text": question["text"],
+                                        "question_id": question["id"],
+                                        "tts_latency_ms": round(tts_latency * 1000),
+                                        "has_audio": True,
+                                    },
+                                )
+                                
+                                for i in range(0, len(audio_bytes), chunk_size):
+                                    chunk = audio_bytes[i : i + chunk_size]
+                                    await manager.send_audio_chunk(session_id, chunk, "question")
+                                    await asyncio.sleep(0.01)
+                            continue
+
                         answer = BotLogic.parse_yes_no(transcription)
                         
                         if answer is None:
