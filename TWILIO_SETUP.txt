@@ -1,0 +1,188 @@
+TWILIO TELEPHONY INTEGRATION SETUP
+
+=== ARCHITECTURE ===
+
+Phone Call → Twilio SIP → POST /voice → TwiML with WebSocket stream URL
+                                          ↓
+                                WebSocket /ws/twilio/{session_id}
+                                          ↓
+                                Decode Twilio μ-law 8kHz
+                                          ↓
+                                Resample to 16kHz PCM
+                                          ↓
+                                Send to OpenAI Whisper
+                                          ↓
+                                State Machine Logic (existing)
+                                          ↓
+                                ElevenLabs TTS (16kHz MP3)
+                                          ↓
+                                Resample to 8kHz PCM
+                                          ↓
+                                Encode to μ-law
+                                          ↓
+                                Send back to Twilio WebSocket
+                                          ↓
+                                Twilio → Speaker
+
+=== AUDIO FORMAT ===
+
+Twilio sends 8kHz mono μ-law encoded audio (standard for telephony).
+
+Whisper requires: 16kHz mono PCM WAV
+
+ElevenLabs returns: 16kHz MP3
+
+Conversion pipeline implemented in AudioConverter class:
+1. Twilio sends base64 μ-law chunks
+2. Decode base64 → raw μ-law bytes
+3. μ-law → PCM (AudioConverter.ulaw_to_pcm)
+4. 8kHz → 16kHz (AudioConverter.resample_8k_to_16k)
+5. Create WAV and send to Whisper
+6. ElevenLabs returns MP3
+7. Decode MP3 to PCM (uses ffmpeg internally in elevenlabs SDK)
+8. 16kHz → 8kHz (AudioConverter.resample_16k_to_8k)
+9. PCM → μ-law (AudioConverter.pcm_to_ulaw)
+10. Encode to base64
+11. Send via WebSocket media message
+
+=== ENDPOINTS ===
+
+1. POST /voice
+   - Twilio calls this when user dials your number
+   - Returns TwiML XML with WebSocket stream URL
+   - Example: <Start><Stream url="wss://yourdomain.com/ws/twilio/{session_id}" /></Start>
+
+2. WebSocket /ws/twilio/{session_id}
+   - Handles Twilio Media Stream protocol
+   - Receives events:
+     * "start": Call started
+     * "media": Audio chunk with base64 payload
+     * "stop": Call ended
+   - Sends audio chunks back as media messages with base64 payload
+   - Maintains full state machine session per call
+
+=== IMPLEMENTATION DETAILS ===
+
+AudioConverter class handles all audio conversions:
+- ulaw_to_pcm(): Converts μ-law encoded bytes to PCM int16 (numpy based)
+- pcm_to_ulaw(): Converts PCM to μ-law with silence detection
+- resample_8k_to_16k(): Linear interpolation resampling (fast, no scipy)
+- resample_16k_to_8k(): Downsampling by taking every 2nd sample
+
+State Machine:
+- Each call gets unique session_id
+- Maintains state: GREETING → Q1 → Q2 → Q3 → RESULT → END
+- Each question gets yes/no answer
+- Eligible if all 3 YES (QuickRupee) or per-bot logic
+- Clean disconnection on call end
+
+=== TESTING ===
+
+1. Local Testing (before real Twilio):
+   - Use ngrok to expose backend: ngrok http 8000
+   - Update TWILIO_DOMAIN in .env to your ngrok URL
+   - Configure Twilio webhook to https://your-ngrok-url/voice
+
+2. Live Testing:
+   - Deploy backend (ensure TLS/SSL)
+   - Update .env TWILIO_DOMAIN to real domain
+   - Configure Twilio incoming call webhook
+   - Call your Twilio phone number
+   - Bot should answer and ask questions
+
+=== PRODUCTION CHECKLIST ===
+
+[ ] OPENAI_API_KEY set in environment
+[ ] ELEVENLABS_API_KEY set in environment
+[ ] TWILIO_ACCOUNT_SID set in environment
+[ ] TWILIO_AUTH_TOKEN set in environment
+[ ] TWILIO_PHONE_NUMBER set in environment (the number you're using)
+[ ] TWILIO_DOMAIN set to real domain (with TLS)
+[ ] Twilio webhook configured: POST https://yourdomain.com/voice
+[ ] Backend running with uvicorn (use Gunicorn for production)
+[ ] WebSocket secure (wss://) on production domain
+[ ] Error logging configured
+[ ] Session cleanup on disconnect
+[ ] Timeouts set (120 sec per call max)
+[ ] Per-call isolation (no global state sharing)
+
+=== CODE FLOW ===
+
+app.post("/voice"):
+  1. Generate unique session_id
+  2. Create TwiML response
+  3. Add Start element with Stream URL containing session_id
+  4. Return as XML
+
+app.websocket("/ws/twilio/{session_id}"):
+  1. Accept WebSocket
+  2. Create new SessionData (bot state machine)
+  3. Generate greeting audio via ElevenLabs (16kHz MP3)
+  4. Convert MP3 → PCM 16kHz → PCM 8kHz → μ-law 8kHz
+  5. Send greeting in Twilio media messages
+  6. Loop:
+     a. Receive Twilio media event with base64 μ-law chunk
+     b. Accumulate until 8000 bytes (1 second of audio)
+     c. Decode base64 → μ-law → PCM 8kHz → PCM 16kHz
+     d. Create WAV file
+     e. Send to Whisper API
+     f. Parse yes/no answer
+     g. Update state machine
+     h. Generate response audio (question or result)
+     i. Convert response and send back
+     j. Continue until call ends
+
+=== FILES ADDED/MODIFIED ===
+
+Modified:
+- backend/main.py: Added /voice endpoint, /ws/twilio endpoint, AudioConverter class
+- backend/requirements.txt: Added twilio, scipy, numpy
+- .env.example: Added Twilio credentials
+
+No other files changed. Web UI remains same (browser WebSocket continues to work).
+
+=== AUDIO CONVERSION ALGORITHMS ===
+
+μ-law decoding (8-bit to 16-bit PCM):
+  Sample = ~byte (invert bits)
+  sign = (Sample & 0x80) >> 7
+  exponent = (Sample & 0x70) >> 4
+  mantissa = Sample & 0x0F
+  mantissa = (mantissa << 3) + 0x84
+  if exponent > 0: mantissa = mantissa << exponent
+  if sign == 0: result = +mantissa else: result = -mantissa
+
+μ-law encoding (16-bit PCM to 8-bit):
+  Inverse of above. Applies compression with non-linear quantization.
+
+Resampling 8k→16k (linear interpolation):
+  output[0] = input[0]
+  output[1] = (input[0] + input[1]) / 2
+  output[2] = input[1]
+  output[3] = (input[1] + input[2]) / 2
+  ...
+
+Resampling 16k→8k (downsampling):
+  Take every 2nd sample: output = input[::2]
+
+=== CONCURRENT CALLS ===
+
+Each call creates:
+- Unique session_id
+- Separate WebSocket connection
+- Isolated SessionData object
+- Per-call audio buffer
+- Per-call state machine
+
+No global state modified. ConnectionManager uses dict keyed by session_id.
+Up to OS WebSocket limits (typically 65k connections).
+
+=== ERROR HANDLING ===
+
+WebSocketDisconnect: Cleans up session data, audio buffers, connection
+Timeout (120 sec): Closes WebSocket, cleans up
+API errors: Logs and sends error responses
+Invalid audio: Skips chunk, continues
+Malformed JSON: Logs error, continues
+
+All exceptions caught and logged. Sessions always cleaned.
