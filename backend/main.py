@@ -435,7 +435,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             },
         )
         
-        chunk_size = 4096
+        chunk_size = 16000
         for i in range(0, len(audio_bytes), chunk_size):
             chunk = audio_bytes[i : i + chunk_size]
             await manager.send_audio_chunk(session_id, chunk, "greeting")
